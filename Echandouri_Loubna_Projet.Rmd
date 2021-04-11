@@ -1,0 +1,392 @@
+---
+title: "Projet : Cancer du Sein"
+author: "Echandouri  Loubna"
+date: "30/03/2021"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidyr)
+library(base)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(skimr)
+library(ggrepel)
+require(reshape2)
+library(corrplot)
+library(modelr)
+library(solitude)
+library(Hmisc)
+library(rsample)
+library(rms)
+library(glue)
+require(devtools)
+library(pscl)
+library(caret)
+library(e1071)
+library(ranger)
+library(fastshap)
+library(knitr)
+library(questionr)
+setwd("C:/Users/lecnd/OneDrive - Université Paris-Dauphine/Desktop/Courses and Books/M2 Maths/2020/Analyse Multivariée R/project_breast_cancer")
+```
+
+# Objectif
+
+Le cancer du sein est le cancer le plus mortel et le plus fréquent chez les femmes. En 2020, 2,261,419 cas de cancers du sein ont été comptés dans le monde entier, dont 684,996 décès. Malgré une baisse du taux d'incidence d'année en année, il semblerait que cette baisse soit irrégulière et peu rapide. La survie nette est de 97\% à 1 an et de 88\% à 5 ans, selon les derniers chiffres publiés en 2020 par Santé Publique France. Ce cancer du sein peut aussi toucher l'homme, mais dans une très faible proportion (moins de 1\% de l'ensemble des cas). Il devient donc nécessaire de dépister tôt. 
+
+Ce projet a pour but de faire un travail de prédiction sur le caractère bénin ou malin d'une masse se trouvant dans le sein. Le jeu de données utilisé est le suivant : <https://www.kaggle.com/uciml/breast-cancer-wisconsin-data>. Il présente les caractéristiques de noyaux cellulaires, dont l'image en 3D a été récupérée après une biopsie par aspiration de la masse en question.
+
+
+```{r}
+dataset <- read.csv('breast_cancer_wisconsin.csv', sep=',')
+colnames(dataset)
+```
+Voilà les variables dans leur globalité qu'on peut trouver :
+
+* id 
+* diagnosis (M = malignant, B = benign) : la variable cible
+
+et il y a 10 types de variables explicatives continues, dont les valeurs sont données pour chaque noyau cellulaire:
+
+* radius (moyenne des distances du centre aux points sur le périmètre)
+* texture (écart type des valeurs des niveaux de gris)
+* perimeter (périmètre)
+* area (aire)
+* smoothness (variation locale des rayons)
+* compactness (perimeter² / area - 1.0)
+* concavity (sévérité des parties concaves du contour)
+* concave points (nombre de parties concaves du contour)
+* symmetry (symétrie)
+* fractal dimension ("approximation littorale" - 1)
+
+Pour chacun de ces types de variables, on trouve différentes mesures. Par exemple, pour le type `radius`, on trouve `radius_worst`, `radius_se` et `radius_means`.
+
+
+```{r, echo=FALSE}
+dataset$diagnosis <- factor(dataset$diagnosis, 
+                   levels = c('M', 'B'),
+                   labels = c(TRUE, FALSE)) # setting feature diagnosis as factor
+dim(dataset)
+```
+
+Nous commençons donc avec un jeu de données de 569 observations, une variable cible (`diagnosis`), une variable d'identification (`id`), et 31 variables explicatives (10 types différents). On peut les observer ci-après :
+
+\small 
+```{r, echo=FALSE}
+t(head(dataset,4))
+```
+\normalsize 
+
+# Mise en forme de la donnée
+
+Avant de commencer l'analyse des données, on commence par examiner les valeurs nulles s'il y en a. On remarque qu'il existe une colonne `X` contenant des `NaN` exclusivement. Le reste des variables ne contient pas de `NaN`.
+
+\footnotesize 
+```{r, fig.align='center'}
+dataset <- subset(dataset, select=-c(X, id)) #deletion of X column full of NaN 
+# and id because of high cardinality (not useful for now)
+skim(dataset)
+```
+\normalsize
+
+Il n'existe plus aucune autre donnée nulle (`NaN`) dans le jeu de données. Le reste des variables explicatives sont bien continues comme le montre le data summary ci-dessus. Toutefois, elles sont d'ordre différent. Ainsi, nous allons standardiser les données afin d'éviter des impacts négatifs sur la modélisation plus tard.
+
+```{r, echo=FALSE}
+dataset_scaled <- rapply(dataset,scale,c('numeric','integer'),how='replace') #scaling
+summary(dataset_scaled$diagnosis)
+```
+
+Pour ce qui est de la variable cible `diagnosis`, on peut voir qu'elle n'est pas n'est pas excessivement déséquilibrée: sur 569 observations, 212 ont le label 'positif' (`Malignant`, qu'on a redéfini en `TRUE`) et 357 ont le label négatif (`Benign`, qu'on a redéfini en `FALSE`).
+
+# Analyse univariée des variables explicatives et de la cible
+
+Dans cette partie, nous allons essayer de regarder les distributions générales des différentes variables explicatives, dans le but de voir comment évoluent les variables et la distribution de la variable cible.
+
+## Variable cible : `diagnosis`
+
+```{r, echo=FALSE, fig.height = 3, fig.width = 3, fig.align='center'}
+ggplot(dataset, aes(x = diagnosis, fill = diagnosis)) +
+  geom_bar(stat = 'count', position = 'stack', show.legend = FALSE) +
+  theme_minimal(base_size = 16) +
+  geom_label(stat = 'count', aes(label = ..count..), position = position_stack(vjust = 0.5),
+             size = 5, show.legend = FALSE)
+```
+
+## Variables explicatives
+
+```{r, echo=FALSE, fig.show='hold', out.width='33%'}
+par(mfrow=c(3,10))
+for(i in 2:ncol(dataset))
+{
+  breaks <- pretty(range(dataset[,i]), n = nclass.FD(dataset[,i]), min.n = 1)
+  bwidth <- breaks[2]-breaks[1]
+  print(ggplot(dataset, aes(x = dataset[,i])) +
+    geom_histogram(aes(y = ..density..), 
+                   binwidth = bwidth, colour = 'dodgerblue2', fill = 'white', size = 0.8) +
+    geom_density(alpha = .3, fill='dodgerblue2', colour = 'dodgerblue2', size = 0.7) +
+    geom_vline(aes(xintercept = mean(dataset[,i])),
+               colour = 'red', linetype ='longdash', size = 1.2)+
+    xlab(as.character((names(dataset))[i])))
+}
+```
+
+
+
+## Détection d'outliers
+
+```{r, echo=FALSE, fig.show='hold', out.width='45%', warning=FALSE, fig.align='center'}
+
+features <- colnames(dataset_scaled)[2:31]
+par(mfrow=c(3,1))
+
+dataset_scaled %>% tidyr::gather('id', 'value',2:11) %>% 
+  ggplot(., aes(x = id, y = value, color = id))+geom_boxplot()+coord_flip()
+dataset_scaled %>% tidyr::gather('id', 'value',12:21) %>% 
+  ggplot(., aes(x = id, y = value, color = id))+geom_boxplot()+coord_flip()
+dataset_scaled %>% tidyr::gather('id', 'value',22:31) %>% 
+  ggplot(., aes(x = id, y = value, color = id))+geom_boxplot()+coord_flip()
+
+
+```
+Les box-plots, ci-dessous, mettent en évidence les différents outliers pour chacune des variables explicatives, toutefois certains des ces points sont à préserver. En effet, certains points 'outliers' sont considérés comme 'leverage points', et contiennent de l'information importante malgré leur valeur distincte. Nous verrons plus tard comment séparer les vrais 'outliers' des 'leverage points'.
+
+# Analyse multivariée des variables explicatives et de la cible
+
+## Matrix de correlation
+
+\small 
+```{r, echo=FALSE,  fig.height=5, fig.width = 6.5, fig.align='center'}
+cor_matrix <- cor(dataset_scaled[,-1])
+corrplot(cor_matrix, method = 'square', type = 'lower',
+         tl.col = 'black', tl.srt = 45,
+         p.mat = cor.mtest(dataset_scaled[,-1])$p,
+         sig.level = 0.05)
+```
+
+\normalsize
+
+On remarque que beaucoup de variables explicatives sont fortement corrélées, souvent positivement. Comme par exemple `radius_mean` et `perimeter_mean` ou encore `perimeter_worst`et `area_mean`. Cela nous sera utile dans la suite, et en vue de la préparation à la modélisation. En effet, sachant qu'on a un nombre assez faible d'observations (`569`), il est nécessaire de réduire le nombre de variables explicatives afin d'obtenir un modèle assez généralisable. Le fait que beaucoup de ces variables soient corrélées nous aide grandement, car cette réduction de dimension ne supprimera pas beaucoup d'information.
+
+
+```{r, echo=FALSE, fig.show='hold', out.width='33%'}
+par(mfrow=c(3,10))
+for(i in 2:ncol(dataset))
+{
+  breaks <- pretty(range(dataset[,i]), n = nclass.FD(dataset[,i]), min.n = 1)
+  bwidth <- breaks[2]-breaks[1]
+  print(ggplot(dataset, aes(x = dataset[,i], y=..density.., color=diagnosis)) +
+          geom_density(size=0.8) +
+          xlab(as.character((names(dataset))[i])))
+}
+
+```
+
+Grâce aux graphiques de distributions des valeurs croisées, on peut identifier à coup d'oeil les variables explicatives dont la distribution change en fonction de la cible. Ces variables ont donc un bon potentiel de prédiction. Par exemple, on remarque que la variable explicative `concave.points_worst` a une distribution gaussienne de moyenne `0.07` environ pour les diagnostics négatifs. Mais elle a une distribution gaussienne de moyenne `1.7` environ pour les diagnostics positifs. A l'inverse, le graphique de la variables explicative `symmetry_se` montre que la distribution change de manière infime entre un diagnostic positif et un diagnostic négatif.
+
+L'analyse multivariée nous a permis de voir qu'une réduction de dimension est possible. D'un côté par le biais de fortes corrélations entre variables explicatives, mais également par le biais du potentiel de prédiction de ces dernières. L'importance de certaines variables plutôt que d'autres sera analysée de plus prêt dans la suite.
+
+# Préparation à la modélisation
+
+## Exclusion d'outliers
+
+Afin d'exclure les outliers, nous allons utiliser la fonction `isolationForest` (package `solitude`). Cela va nous permettre de retirer du jeu de données uniquement les observations aux valeurs extrêmes ne contribuant pas à amener de l'information bénéfique au modèle. 
+
+```{r, results='hide'}
+iforest <- isolationForest$new()
+iforest$fit(dataset_scaled)
+dataset_scaled$pred <- iforest$predict(dataset_scaled)
+dataset_scaled$outlier <- as.factor(ifelse(dataset_scaled$pred$anomaly_score >=0.65,
+                                           'outlier', 'normal'))
+summary(dataset_scaled$outlier)
+```
+9 observations ont été retirées car ayant un `anomaly_score` supérieur à 65\%, et plus le score est proche de 1 plus il est probable que l'observation en question est une anomalie. Ci-après, une partie des observations considérées comme anomalies :
+
+\small 
+```{r, echo=FALSE}
+dataset_outliers <- dataset_scaled[dataset_scaled$outlier=='outlier', ]
+t(head(dataset_outliers,4))
+dataset_scaled <- subset(dataset_scaled, outlier!='outlier')
+dataset_scaled <- subset(dataset_scaled, select=-c(outlier)) #deletion of outlier column 
+dataset_scaled <- subset(dataset_scaled, select=-pred)
+```
+
+\normalsize
+
+## Réduction de dimension
+
+Comme nous l'avons observé précédemment, certaines variables  explicatives sont fortement corrélées, et donc il y a redondance de l'information. Nous allons donc supprimer celles qui sont redondantes. Nous aurions pu également effectuer une ACP, mais par désir de préserver une intérprétabilité du modèle, on a préféré la méthode précédente.
+
+\small 
+```{r, results='hide'}
+full_formula <- as.formula(str_c('diagnosis ~ ', str_c(features, collapse = ' + ')))
+redun <- redun(formula = full_formula, data = dataset_scaled, r2 = 0.9)
+print(redun, long = FALSE)
+redun_features <- redun$Out
+print(redun_features)
+``` 
+\normalsize
+
+# Modélisation et prédiction
+
+Nous pouvons désormais commencer la modélisation et pour ce problème de classification binaire, on va examiner les résultats d'une régression logistique et d'arbres aléatoires. Mais avant tout, nous allons diviser le jeu de données en deux ensembles : un ensemble d'apprentissage et un ensemble de test. L'ensemble d'apprentissage correspond à 75\% du jeu de données initial.
+
+\small 
+
+```{r}
+reduced_features <- intersect(features, redun_features)
+reduced_formula <- as.formula(str_c('diagnosis ~ ', str_c(reduced_features, collapse = ' + ')))
+dataset_scaled_split <- initial_split(dataset_scaled, p = 0.7, strata = diagnosis)
+train <- training(dataset_scaled_split)
+train <- select(train , all_of(c(reduced_features,'diagnosis')))
+test <- testing(dataset_scaled_split)
+test <- select(test , all_of(c(reduced_features,'diagnosis')))
+t(head(train))
+```
+\normalsize 
+
+
+## Logistic Regression
+
+La régression logistique est le premier choix de modèle, car il se prête très bien à ce genre de problème de classification binaire. De plus, il est relativement simple à utiliser et peu coûteux. 
+
+\small 
+```{r, warning=FALSE}
+set.seed(0)
+glm_mod <- glm(reduced_formula, family=binomial(logit), data=train)
+summary(glm_mod)
+```
+
+```{r, warning=FALSE}
+odds.ratio(glm_mod)
+```
+\normalsize
+
+On peut voir , d'après la valeur des `OR` (odd ratios), que les variables explicatives présentes dans le modèle ont toutes un effet sur la variable cible, car leur odd ratio est largement supérieur ou largement inférieur à 1. 
+
+```{r}
+pR2(glm_mod)
+```
+
+Le pseudo-R² de MacFadden vaut 0.92 et indique donc que notre modèle est bon, mais nous allons confirmer ça avec l'ensemble de test.
+
+
+```{r, echo=FALSE, warning=FALSE}
+predtest <- factor(predict(glm_mod,test, type='response') < 0.5, levels=c(TRUE, FALSE))
+confusionMatrix(as.factor(predtest), test$diagnosis, positive='TRUE')
+```
+On observe une `accuracy` de 96\% ce qui est un très bon résultat, mais il ne faut pas oublier le cœur du problème. Dans notre cas, la métrique `accuracy` est nécessaire mais pas suffisante. En effet, la métrique `recall` ou `sensitivity` est la seconde métrique la plus importante. Celle-ci nous permet de nous assurer qu'on évite au maximum les faux négatifs, c'est à dire un diagnostic de cancer négatif alors qu'il est positif. L'effet d'une telle erreur est bien plus grave que celui d'un faux positif. Dans notre cas, la `sensitivity` vaut 98\%, ce qui est très bon. Ce taux peut peut-être être amélioré, par exemple, en ajoutant des cas positifs dans le jeu de données de base (qui, on le rappelle, était un peu déséquilibré). 
+
+## Random Forest
+
+Nous allons voir maintenant le modèle des forêts aléatoires, et nous allons essayer de comparer les résultats trouvés précédemment avec le modèle de régression logistique.
+
+```{r}
+set.seed(0)
+rf_mod <- ranger(reduced_formula, data=train, mtry=4,
+                 num.trees=200, write.forest=TRUE, importance='permutation')
+rf_mod
+```
+
+
+```{r}
+predtest <- predict(rf_mod, test)$prediction
+confusionMatrix(predtest, test$diagnosis, positive='TRUE')
+```
+Le modèle `RandomForest` performe moins bien que le modèle `glm`. On voit que l'`accuracy` vaut 96\%, un taux quasiment similaire au modèle de régression logistique. Mais en ce qui concerne la métrique `sensitivity`, elle vaut 93\% pour `RandomForest`, ce qui est bien plus faible que pour le modèle de régression linéaire. De manière générale, on préférera le modèle de régression logistique, car il est plus simple et moins coûteux, et plus performant.
+
+# Interprétabilité
+
+Dans cette dernière sous-partie, nous allons utiliser la librairie `fastshap`, et les valeurs Shap, afin de comprendre comment chaque variable explicative impacte la cible et à quel point. Des modèles complexes, comme `RandomForest`, nécessitent ce genre de méthode pour pouvoir faire une intérprétation claire.
+
+```{r, warning=FALSE}
+dataset_for_shap <- select(dataset_scaled, all_of(append(reduced_features,'diagnosis')))
+dataset_for_shap$diagnosis <- if_else(dataset_for_shap$diagnosis == TRUE,1,0)
+dataset_scaled_split <- initial_split(dataset_for_shap, p = 0.7, strata = diagnosis)
+train <- training(dataset_scaled_split)
+train <- select(train , all_of(c(reduced_features,'diagnosis')))
+test <- testing(dataset_scaled_split)
+test <- select(test , all_of(c(reduced_features,'diagnosis')))
+rf_for_shap <- ranger(reduced_formula, data=train, mtry=4,
+                      num.trees=200, importance='permutation')
+```
+
+```{r, echo=FALSE, warning=FALSE}
+pfun <- function(object, newdata) {
+  predict(object, data = newdata)$predictions
+}
+
+system.time({
+  set.seed(5038)
+  shap <- explain(rf_for_shap, X = select(dataset_for_shap, -diagnosis), pred_wrapper = pfun, nsim = 10)
+})
+
+theme_set(theme_bw())
+
+shap_imp <- data.frame(
+  Variable = names(shap),
+  Importance = apply(shap, MARGIN = 2, FUN = function(x) sum(abs(x)))
+)
+
+expl <- explain(rf_for_shap, X = select(dataset_for_shap, -diagnosis), pred_wrapper = pfun,
+                          nsim = 10, newdata = select(test, -diagnosis)[6L,])
+
+autoplot(expl, type = 'contribution')
+```
+
+
+```{r, echo=FALSE}
+print('[test set, row 6] -> diagnosis : ')
+print(test[6L,]$diagnosis)
+``` 
+
+```{r, echo=FALSE}
+expl <- explain(rf_for_shap, X = select(dataset_for_shap, -diagnosis), pred_wrapper = pfun,
+                          nsim = 10, newdata = select(test, -diagnosis)[7L,])
+
+autoplot(expl, type = 'contribution')
+```
+```{r, echo=FALSE}
+print('[test set, row 7] -> diagnosis : ')
+
+print(test[7L,]$diagnosis)
+``` 
+Les variables explicatives sont classées dans l'odre décroissant d'importance. Dans l'exemple de la ligne 7 de l'ensemble de test ci-dessus, dont le diagnostic est positif, la variable `perimeter_worst` est la plus importante, et `fractal_dimension_mean` la moins importante. Le graphiqe met en lumière également la correlation positive ou négative avec la variable cible `diagnosis`. Par exemple, `concave.points_mean` et `area_se` sont fortement positivement corrélées à la variable `diagnosis`. Donc plus elles prennent de grandes valeurs, plus il est probable que le diagnostic soit positif.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
